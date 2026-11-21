@@ -201,6 +201,7 @@ def parse_page(url: str, raw_html: str) -> dict:
 def pick_subpages(base_url: str, links: list[str]) -> list[str]:
     host = urllib.parse.urlparse(base_url).hostname
     scored: dict[str, int] = {}
+    kw_of: dict[str, str] = {}
     for href in links:
         u = urllib.parse.urljoin(base_url, href.split("#")[0])
         pu = urllib.parse.urlparse(u)
@@ -209,12 +210,20 @@ def pick_subpages(base_url: str, links: list[str]) -> list[str]:
         path = pu.path.lower().rstrip("/")
         if not path or path.count("/") > 2 or re.search(r"\.(pdf|png|jpg|zip|xml)$", path):
             continue
+        last = path.rsplit("/", 1)[-1]
         for kw, score in SUBPAGE_PRIORITY:
-            if kw in path:
+            # match whole path segments ("/about", "/about-us"), not podcasts like "/founder-chats"
+            if re.fullmatch(rf"(our-)?{kw}[a-z]*(-us|-me)?", last):
                 key = urllib.parse.urlunparse((pu.scheme, pu.netloc, pu.path, "", "", ""))
                 scored[key] = min(scored.get(key, 99), score + path.count("/"))
+                kw_of[key] = "about" if score == 0 else kw  # about/team/story/founder are one bucket
                 break
-    return [u for u, _ in sorted(scored.items(), key=lambda kv: kv[1])][:MAX_SUBPAGES]
+    picked, used = [], set()
+    for u, _ in sorted(scored.items(), key=lambda kv: kv[1]):
+        if kw_of[u] not in used:  # one page per kind: an About page and a Pricing page, not /about + /about-us
+            picked.append(u)
+            used.add(kw_of[u])
+    return picked[:MAX_SUBPAGES]
 
 
 def build_evidence(pages: list[dict]) -> list[dict]:
@@ -275,6 +284,7 @@ The goal: the founder should feel this was written by someone who actually read 
 
 Line 1: the most specific, non-obvious fact on their site: a number, a named customer, a pricing choice, how they're funded, a stated belief.
   Prefer details from About/Pricing pages over the homepage tagline. No flattery, no "I saw/noticed".
+  It must be about THIS company and its product, not about a podcast guest, blog subject, customer story or another company it mentions.
 Line 2: the "so what". Connect that fact to a concrete consequence for their business, framed as your honest guess ("my guess is...", "usually that means...").
   If a sender pitch is given, tie it in here in plain words; if not, keep line 2 about them.
 Line 3: one short, specific question the founder could answer in a sentence, following from line 2. No meeting request, no "would you be open to".
@@ -535,9 +545,9 @@ def make_opener(raw_url: str, pitch: str = "", use_cache: bool = True) -> dict:
             continue
         if draft.get("enough_info") is False:
             # Small models sometimes give up on sites that have plenty to work with: push back once.
-            if attempt == 0 and sum(len(s["text"]) for s in evidence) > 1500:
-                problems = [f"You set enough_info to false, but there are {len(evidence)} snippets. "
-                            "Pick the single most specific one for line 1 and write the opener."]
+            if attempt < 2 and sum(len(s["text"]) for s in evidence) > 1500:
+                problems = [f"enough_info must be true: there are {len(evidence)} snippets. "
+                            "Pick the single most specific fact about the company itself for line 1 and write all 3 lines."]
                 continue
             raise ValueError("The model judged the site too thin to write something specific. Not drafting.")
         problems = validate(draft, evidence, pitch)
