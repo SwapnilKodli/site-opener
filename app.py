@@ -285,29 +285,102 @@ Return JSON only:
  "lines": [{"text": str, "evidence": [snippet ids]}, {"text": str, "evidence": [...]}, {"text": str, "evidence": [...]}]}"""
 
 
-def _post_json(url: str, payload: dict, headers: dict) -> dict:
+def _post_json(url: str, payload: dict, headers: dict, retries: int = 2, timeout: int = 90) -> dict:
     req = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST",
                                  headers={"Content-Type": "application/json", **headers})
-    try:
-        with urllib.request.urlopen(req, timeout=40) as r:
-            return json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode(errors="replace")[:300]
-        if e.code == 429:
-            raise RuntimeError("The model's free-tier rate limit was hit. Try again in a minute.")
-        raise RuntimeError(f"Model API error {e.code}: {detail}")
+    for attempt in range(retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            if e.code in (500, 502, 503, 504) and attempt < retries:
+                time.sleep(2 * (attempt + 1))  # provider overloaded: back off and retry
+                continue
+            _raise_http(e)
+        except (TimeoutError, socket.timeout, urllib.error.URLError) as e:
+            if attempt < retries:
+                continue
+            err = RuntimeError(f"The model API didn't respond ({getattr(e, 'reason', e)}). Try again shortly.")
+            err.status = 504
+            raise err
+
+
+def _raise_http(e: urllib.error.HTTPError):
+    detail = e.read().decode(errors="replace")[:300]
+    if e.code == 429:
+        msg = "The model's free-tier rate limit was hit. Try again in a minute."
+    elif e.code in (500, 502, 503, 504):
+        msg = f"The model API is overloaded (HTTP {e.code}). Try again shortly."
+    else:
+        msg = f"Model API error {e.code}: {detail}"
+    err = RuntimeError(msg)
+    err.status = e.code
+    raise err
+
+
+GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
+_gemini_model: str | None = None
+
+
+_gemini_ranked: list[str] = []
+
+
+def gemini_candidates(key: str) -> list[str]:
+    """Ask the API which models this key can use and rank the Gemini 'flash' text models:
+    newest full Flash first, then previews, then Lite. Avoids hard-coding a model Google later retires."""
+    global _gemini_ranked
+    if _gemini_ranked:
+        return _gemini_ranked
+    req = urllib.request.Request(f"{GEMINI_BASE}/models?pageSize=200", headers={"x-goog-api-key": key})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        models = json.loads(r.read()).get("models", [])
+
+    def rank(n: str) -> tuple:
+        m = re.search(r"gemini-(\d+(?:\.\d+)?)", n)
+        return ("lite" in n, "preview" in n, -(float(m.group(1)) if m else 0.0), "latest" in n)
+
+    names = [m["name"].split("/", 1)[-1] for m in models
+             if "generateContent" in m.get("supportedGenerationMethods", [])]
+    flash = [n for n in names if n.startswith("gemini") and "flash" in n
+             and not re.search(r"image|tts|live|audio|embed|thinking|exp|omni|transcribe", n)]
+    if not flash:
+        raise RuntimeError("No Gemini 'flash' model is available to this API key. Set MODEL in .env.")
+    _gemini_ranked = sorted(flash, key=rank)
+    return _gemini_ranked
+
+
+def pick_gemini_model(key: str) -> str:
+    return gemini_candidates(key)[0]
 
 
 def call_model(system: str, user: str) -> tuple[str, dict]:
+    global _gemini_model
     provider = os.getenv("PROVIDER") or ("gemini" if os.getenv("GEMINI_API_KEY") else "groq" if os.getenv("GROQ_API_KEY") else "")
     if provider == "gemini":
-        model = os.getenv("MODEL", "gemini-2.5-flash")
-        data = _post_json(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-            {"systemInstruction": {"parts": [{"text": system}]},
-             "contents": [{"role": "user", "parts": [{"text": user}]}],
-             "generationConfig": {"temperature": 0.5, "responseMimeType": "application/json"}},
-            {"x-goog-api-key": os.environ["GEMINI_API_KEY"]})
+        key = os.environ["GEMINI_API_KEY"]
+        payload = {"systemInstruction": {"parts": [{"text": system}]},
+                   "contents": [{"role": "user", "parts": [{"text": user}]}],
+                   "generationConfig": {"temperature": 0.5, "responseMimeType": "application/json"}}
+        first = os.getenv("MODEL") or _gemini_model
+        order = ([first] if first else []) + [m for m in gemini_candidates(key) if m != first]
+        data, deadline = None, time.time() + 150
+        for model in order:
+            if time.time() > deadline:
+                break
+            try:
+                data = _post_json(f"{GEMINI_BASE}/models/{model}:generateContent", payload, {"x-goog-api-key": key},
+                                  retries=0, timeout=45)
+                break
+            except RuntimeError as e:  # retired (404), overloaded (5xx) or quota (429): try the next model
+                status = getattr(e, "status", None)
+                if status == 404 and model in _gemini_ranked:
+                    _gemini_ranked.remove(model)  # retired for this key: never try it again
+                elif status not in (429, 500, 502, 503, 504):
+                    raise
+        if data is None:
+            raise RuntimeError("Every Gemini model available to this key is busy or rate-limited right now. "
+                               "Try again in a minute.")
+        _gemini_model = model
         text = "".join(p.get("text", "") for p in data["candidates"][0]["content"]["parts"])
         u = data.get("usageMetadata", {})
         return text, {"model": model, "in": u.get("promptTokenCount"), "out": u.get("candidatesTokenCount")}
