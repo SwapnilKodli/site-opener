@@ -24,6 +24,8 @@ To deploy on Render, connect the repo as a Python web service with start command
 | Dedupe, interleave pages, cap to 40 numbered snippets (~7k chars) | code | Keeps the prompt small and cost fixed |
 | Refuse if the site has under 300 chars of text | code | A JS-only site won't get a made-up opener |
 | Pick the angle and write the 3 lines, citing snippet IDs, returning JSON | model | |
-| Validate: 3 lines, ≤30 words each, banned clichés, line 1 cites a real snippet, every number and the founder's name appear on the site | code | |
-| If validation fails, retry once with the errors. If it still fails, show the warnings | code + model | |
+| Greet by first name only if a cited snippet names them as founder/CEO, otherwise "Hi there," | code | |
+| Pick a Gemini Flash model the key can use, and skip retired, busy or rate-limited ones | code | Free-tier quotas and model retirements don't break it |
+| Validate: 3 lines, ≤30 words each, banned clichés, line 1 cites a real snippet, every number (digits or words) and the founder's name appear on the site, no greeting inside the lines | code | |
+| If validation fails, retry with the errors (up to 3 calls). If it still fails, show the warnings | code + model | |
 | Cache results by domain and pitch for 24h | code | |

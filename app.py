@@ -42,6 +42,7 @@ BANNED = [
     "i am impressed", "game-changer", "game changer", "revolutioniz",
     "cutting-edge", "synergy", "quick question", "touch base",
     "i noticed that you", "love what you're doing", "love what you are doing",
+    "constant challenge", "would you be open to", "are you open to",
 ]
 
 SUBPAGE_PRIORITY = [
@@ -158,6 +159,7 @@ class PageParser(HTMLParser):
                 self.meta[key] = (a.get("content") or "").strip()
         elif tag == "a" and a.get("href"):
             self.links.append(a["href"])
+        self._buf.append(" ")  # tag boundaries are word boundaries: "Collect<b>High</b>" -> "Collect High"
         if tag in BLOCK:
             self._flush()
             self._cur_block = tag
@@ -168,6 +170,7 @@ class PageParser(HTMLParser):
             return
         if tag == "title":
             self._in_title = False
+        self._buf.append(" ")
         if tag in BLOCK:
             self._flush()
             self._cur_block = "p"
@@ -268,16 +271,25 @@ def research(url: str) -> tuple[list[dict], list[str]]:
 # --------------------------------------------------------------------------- model
 SYSTEM = """You write the first 3 lines of a cold email to the FOUNDER of a company, using ONLY the website snippets provided.
 
-Line 1: one specific, concrete observation about their company drawn from the snippets (a product detail, a customer, a positioning choice, a number). Not flattery.
-Line 2: connect that observation to a plausible challenge or opportunity for a company like theirs, and, if a sender pitch is given, why it is relevant. Be honest that it is an inference.
-Line 3: a low-friction question or ask. No meeting request with a time.
+The goal: the founder should feel this was written by someone who actually read their site, not by a template.
+
+Line 1: the most specific, non-obvious fact on their site: a number, a named customer, a pricing choice, how they're funded, a stated belief.
+  Prefer details from About/Pricing pages over the homepage tagline. No flattery, no "I saw/noticed".
+Line 2: the "so what". Connect that fact to a concrete consequence for their business, framed as your honest guess ("my guess is...", "usually that means...").
+  If a sender pitch is given, tie it in here in plain words; if not, keep line 2 about them.
+Line 3: one short, specific question the founder could answer in a sentence, following from line 2. No meeting request, no "would you be open to".
+
+Example of the style (for a made-up company; do not reuse its facts):
+  "Your pricing page caps the free plan at 3 projects but lets everyone invite unlimited teammates."
+  "My guess is that makes team accounts your main upgrade path, so knowing which teams are about to hit the cap matters more than overall signups."
+  "Do you watch for that today, or does it show up when they email support?"
 
 Hard rules:
 - Every factual claim about the company must come from a cited snippet. Do not invent names, numbers, customers, funding, or headcount.
 - Use numbers exactly as written on the site. Never calculate new ones (e.g. 100% - 97% = 3%).
-- Address the founder by first name ONLY if a snippet clearly names them as founder/CEO; otherwise no name.
-- Each line <= 30 words. Plain, specific, human. No exclamation marks.
-- Never use: "hope this email finds you", "I came across", "impressed", "game-changer", "cutting-edge", "quick question".
+- Set "founder_first_name" ONLY if a cited snippet names them as founder/co-founder/CEO. Do NOT put a greeting or their name in the lines; code adds "Hi <name>," itself.
+- Each line <= 30 words. Plain, specific, human. No exclamation marks, no buzzwords.
+- Never use: "hope this email finds you", "I came across", "impressed", "game-changer", "cutting-edge", "quick question", "constant challenge", "would you be open to".
 - If the snippets are too thin to say anything specific, set "enough_info" to false.
 
 Return JSON only:
@@ -424,13 +436,21 @@ _NUM = re.compile(r"(\d+(?:,\d{3})*(?:\.\d+)?)\s*(k|m|b|thousand|million|billion
 _MULT = {"k": 1e3, "thousand": 1e3, "m": 1e6, "million": 1e6, "b": 1e9, "billion": 1e9}
 
 
+_WORDNUMS = {w: i for i, w in enumerate(
+    "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen "
+    "sixteen seventeen eighteen nineteen twenty".split()) if i >= 2}  # skip "one": too common ("one place")
+_WORDNUM = re.compile(r"\b(" + "|".join(_WORDNUMS) + r")\b", re.I)
+
+
 def _numbers(text: str) -> list[str]:
-    """Numbers as written, e.g. '40,000', '$1 million', '97', '2022'."""
-    return [m.group(0).strip() for m in _NUM.finditer(text)]
+    """Numbers as written, e.g. '40,000', '$1 million', '97', '2022', 'three'."""
+    return [m.group(0).strip() for m in _NUM.finditer(text)] + [m.group(0) for m in _WORDNUM.finditer(text)]
 
 
 def _numbers_equiv(num: str) -> set[float]:
-    """All values a written number can mean: '40k' -> {40, 40000}; '40,000' -> {40000}."""
+    """All values a written number can mean: '40k' -> {40, 40000}; '40,000' -> {40000}; 'three' -> {3}."""
+    if num.lower() in _WORDNUMS:
+        return {float(_WORDNUMS[num.lower()])}
     m = _NUM.fullmatch(num.strip())
     if not m:
         return set()
@@ -477,6 +497,10 @@ def validate(draft: dict, evidence: list[dict], pitch: str = "") -> list[str]:
     fname = draft.get("founder_first_name")
     if fname and fname.lower() not in corpus:
         problems.append(f"Founder name '{fname}' isn't on the site; drop it.")
+    for n, ln in enumerate(lines, 1):
+        if re.match(r"^\s*(hi|hey|hello|dear)\b", ln.get("text") or "", re.I) or (
+                fname and re.match(rf"^\s*{re.escape(fname)}\s*,", ln.get("text") or "", re.I)):
+            problems.append(f"Line {n} opens with a greeting or name; code adds the greeting, remove it.")
     return problems
 
 
@@ -508,17 +532,28 @@ def make_opener(raw_url: str, pitch: str = "", use_cache: bool = True) -> dict:
             problems = ["Output was not valid JSON."]
             continue
         if draft.get("enough_info") is False:
+            # Small models sometimes give up on sites that have plenty to work with: push back once.
+            if attempt == 0 and sum(len(s["text"]) for s in evidence) > 1500:
+                problems = [f"You set enough_info to false, but there are {len(evidence)} snippets. "
+                            "Pick the single most specific one for line 1 and write the opener."]
+                continue
             raise ValueError("The model judged the site too thin to write something specific. Not drafting.")
         problems = validate(draft, evidence, pitch)
         if not problems:
             break
 
     by_id = {s["id"]: s for s in evidence}
+    # Greet by name only when a cited snippet names them next to a founder-type role.
+    fname = (draft.get("founder_first_name") or "").strip()
+    backing = [by_id[c]["text"] for c in (draft.get("founder_evidence") or []) if c in by_id]
+    founder_ok = bool(fname) and any(
+        fname.lower() in t.lower() and re.search(r"found|ceo|started|created|built by|maker", t, re.I) for t in backing)
     result = {
         "url": url,
         "pages_read": visited,
         "company": draft.get("company"),
-        "founder_first_name": draft.get("founder_first_name"),
+        "founder_first_name": fname if founder_ok else None,
+        "greeting": f"Hi {fname}," if founder_ok else "Hi there,",
         "lines": [{"text": l.get("text", ""), "evidence": [by_id[c] for c in (l.get("evidence") or []) if c in by_id]}
                   for l in (draft.get("lines") or [])],
         "warnings": problems,
@@ -572,6 +607,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     if len(sys.argv) > 1:
         res = make_opener(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "", use_cache=False)
+        print(res["greeting"])
         print("\n".join(l["text"] for l in res["lines"]))
         print("\n---\n" + json.dumps({k: res[k] for k in ("pages_read", "warnings", "attempts", "usage", "seconds")}, indent=2))
         return

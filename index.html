@@ -20,6 +20,7 @@
   .line { margin:0 0 12px } .line:last-child { margin:0 }
   .cites { display:flex; flex-wrap:wrap; gap:6px; margin-top:4px }
   .cite { font-size:12px; background:var(--cite); padding:2px 8px; border-radius:6px; cursor:help; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+  .cite.open { white-space:normal; cursor:pointer }
   .meta { font-size:13px; color:var(--muted); margin-top:14px }
   .warn { color:var(--warn); font-size:14px } .err { color:var(--warn) }
   .row { display:flex; gap:10px; align-items:center } .row button { margin-top:0 }
@@ -53,13 +54,19 @@ $('#f').onsubmit = async e => {
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || 'Something went wrong');
     const lines = d.lines.map(l => `<p class="line">${esc(l.text)}${l.evidence.length ? `<span class="cites">${
-      l.evidence.map(s => `<span class="cite" title="${esc(s.text)}\n— ${esc(s.url)}">“${esc(s.text.slice(0,70))}${s.text.length>70?'…':''}”</span>`).join('')}</span>` : ''}</p>`).join('');
+      l.evidence.map(s => `<span class="cite" tabindex="0" title="Tap to expand. Source: ${esc(s.url)}" data-full="“${esc(s.text)}” (${esc(new URL(s.url).pathname)})">“${esc(s.text.slice(0,70))}${s.text.length>70?'…':''}”</span>`).join('')}</span>` : ''}</p>`).join('');
     const warn = d.warnings.length ? `<p class="warn">Checks still failing after retry, edit before sending:<br>• ${d.warnings.map(esc).join('<br>• ')}</p>` : '';
-    $('#out').innerHTML = `<div class="card">${warn}${lines}
+    const greet = `<p class="line">${esc(d.greeting || '')}${d.founder_first_name ? '' : ' <span class="meta">(no founder named on the site)</span>'}</p>`;
+    $('#out').innerHTML = `<div class="card">${warn}${greet}${lines}
       <div class="row" style="margin-top:16px"><button class="ghost" id="copy">Copy text</button></div>
       <p class="meta">Read ${d.pages_read.map(u => `<a href="${esc(u)}" target="_blank" rel="noopener">${esc(new URL(u).pathname)}</a>`).join(', ')}
       · ${d.attempts} model call${d.attempts>1?'s':''} · ${d.seconds}s${d.cached?' · cached':''}</p></div>`;
-    $('#copy').onclick = () => { navigator.clipboard.writeText(d.lines.map(l => l.text).join('\n')); $('#copy').textContent = 'Copied'; };
+    document.querySelectorAll('.cite').forEach(c => c.onclick = () => {
+      if (!c.dataset.short) c.dataset.short = c.textContent;
+      const open = c.classList.toggle('open');
+      c.textContent = open ? c.dataset.full : c.dataset.short;
+    });
+    $('#copy').onclick = () => { navigator.clipboard.writeText([d.greeting, ...d.lines.map(l => l.text)].filter(Boolean).join('\n')); $('#copy').textContent = 'Copied'; };
   } catch (err) {
     $('#out').innerHTML = `<div class="card err">${esc(err.message)}</div>`;
   } finally { btn.disabled = false; btn.textContent = 'Draft opener'; }
