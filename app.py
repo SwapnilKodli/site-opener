@@ -406,7 +406,9 @@ def call_model(system: str, user: str) -> tuple[str, dict]:
         _gemini_model = model
         text = "".join(p.get("text", "") for p in data["candidates"][0]["content"]["parts"])
         u = data.get("usageMetadata", {})
-        return text, {"model": model, "in": u.get("promptTokenCount"), "out": u.get("candidatesTokenCount")}
+        # "out" includes thinking tokens: Google bills them as output.
+        return text, {"model": model, "in": u.get("promptTokenCount"),
+                      "out": (u.get("candidatesTokenCount") or 0) + (u.get("thoughtsTokenCount") or 0)}
     if provider == "groq":
         model = os.getenv("MODEL", "llama-3.3-70b-versatile")
         data = _post_json(
