@@ -274,6 +274,7 @@ Line 3: a low-friction question or ask. No meeting request with a time.
 
 Hard rules:
 - Every factual claim about the company must come from a cited snippet. Do not invent names, numbers, customers, funding, or headcount.
+- Use numbers exactly as written on the site. Never calculate new ones (e.g. 100% - 97% = 3%).
 - Address the founder by first name ONLY if a snippet clearly names them as founder/CEO; otherwise no name.
 - Each line <= 30 words. Plain, specific, human. No exclamation marks.
 - Never use: "hope this email finds you", "I came across", "impressed", "game-changer", "cutting-edge", "quick question".
@@ -319,7 +320,9 @@ def _raise_http(e: urllib.error.HTTPError):
 
 
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
-_gemini_model: str | None = None
+_gemini_model: str | None = None   # last model that answered: tried first next time
+_retired: set[str] = set()          # models that 404 for this key
+_cooldown: dict[str, float] = {}    # model -> time until which it's deprioritised after a 429/5xx
 
 
 _gemini_ranked: list[str] = []
@@ -362,20 +365,28 @@ def call_model(system: str, user: str) -> tuple[str, dict]:
                    "contents": [{"role": "user", "parts": [{"text": user}]}],
                    "generationConfig": {"temperature": 0.5, "responseMimeType": "application/json"}}
         first = os.getenv("MODEL") or _gemini_model
-        order = ([first] if first else []) + [m for m in gemini_candidates(key) if m != first]
-        data, deadline = None, time.time() + 150
+        now = time.time()
+        rest = [m for m in gemini_candidates(key) if m != first and m not in _retired]
+        # Models that were busy recently go to the back of the queue instead of being retried first.
+        rest.sort(key=lambda m: _cooldown.get(m, 0) > now)
+        order = ([first] if first and first not in _retired else []) + rest
+        data, deadline = None, now + 120
         for model in order:
             if time.time() > deadline:
                 break
             try:
                 data = _post_json(f"{GEMINI_BASE}/models/{model}:generateContent", payload, {"x-goog-api-key": key},
-                                  retries=0, timeout=45)
+                                  retries=0, timeout=40)
                 break
-            except RuntimeError as e:  # retired (404), overloaded (5xx) or quota (429): try the next model
+            except RuntimeError as e:  # retired (404), overloaded (5xx/timeout) or quota (429): try the next model
                 status = getattr(e, "status", None)
-                if status == 404 and model in _gemini_ranked:
-                    _gemini_ranked.remove(model)  # retired for this key: never try it again
-                elif status not in (429, 500, 502, 503, 504):
+                if status == 404:
+                    _retired.add(model)  # retired for this key: never try it again (set = safe across threads)
+                elif status in (429, 500, 502, 503, 504):
+                    _cooldown[model] = time.time() + 300
+                    if _gemini_model == model:
+                        _gemini_model = None
+                else:
                     raise
         if data is None:
             raise RuntimeError("Every Gemini model available to this key is busy or rate-limited right now. "
@@ -409,15 +420,35 @@ def _mock(user: str) -> str:
 
 
 # --------------------------------------------------------------------------- validate
+_NUM = re.compile(r"(\d+(?:,\d{3})*(?:\.\d+)?)\s*(k|m|b|thousand|million|billion)?(?![a-z])", re.I)
+_MULT = {"k": 1e3, "thousand": 1e3, "m": 1e6, "million": 1e6, "b": 1e9, "billion": 1e9}
+
+
+def _numbers(text: str) -> list[str]:
+    """Numbers as written, e.g. '40,000', '$1 million', '97', '2022'."""
+    return [m.group(0).strip() for m in _NUM.finditer(text)]
+
+
+def _numbers_equiv(num: str) -> set[float]:
+    """All values a written number can mean: '40k' -> {40, 40000}; '40,000' -> {40000}."""
+    m = _NUM.fullmatch(num.strip())
+    if not m:
+        return set()
+    base = float(m.group(1).replace(",", ""))
+    unit = (m.group(2) or "").lower()
+    return {base, base * _MULT[unit]} if unit else {base}
+
+
 def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9%$.]+", " ", s.lower())
 
 
-def validate(draft: dict, evidence: list[dict]) -> list[str]:
+def validate(draft: dict, evidence: list[dict], pitch: str = "") -> list[str]:
     """Code-side guardrails. Returns a list of problems (empty == pass)."""
     problems = []
     ids = {s["id"] for s in evidence}
     corpus = _norm(" ".join(s["text"] for s in evidence))
+    site_numbers = set().union(*(_numbers_equiv(x) for x in _numbers(" ".join(s["text"] for s in evidence) + " " + pitch)))
     lines = draft.get("lines") or []
     if len(lines) != 3:
         return [f"Expected exactly 3 lines, got {len(lines)}."]
@@ -440,10 +471,9 @@ def validate(draft: dict, evidence: list[dict]) -> list[str]:
         if n == 1 and not [c for c in cited if c in ids]:
             problems.append("Line 1 must cite at least one snippet.")
         # every number in the line must appear somewhere in the evidence
-        for num in re.findall(r"\$?\d[\d,.]*%?[kKmMbB]?\+?", text):
-            core = re.sub(r"[^0-9.]", "", num).strip(".")
-            if core and core not in corpus.replace(",", ""):
-                problems.append(f"Line {n} mentions '{num}', which isn't on the site.")
+        for num in _numbers(text):
+            if not (_numbers_equiv(num) & site_numbers):
+                problems.append(f"Line {n} mentions '{num}', which isn't written on the site.")
     fname = draft.get("founder_first_name")
     if fname and fname.lower() not in corpus:
         problems.append(f"Founder name '{fname}' isn't on the site; drop it.")
@@ -468,7 +498,7 @@ def make_opener(raw_url: str, pitch: str = "", use_cache: bool = True) -> dict:
             f"Snippets:\n{snippet_block}")
 
     usage, problems, draft = [], [], {}
-    for attempt in range(2):
+    for attempt in range(3):
         msg = user if attempt == 0 else (user + "\n\nYour previous draft failed these checks; fix them:\n- " + "\n- ".join(problems))
         text, u = call_model(SYSTEM, msg)
         usage.append(u)
@@ -479,7 +509,7 @@ def make_opener(raw_url: str, pitch: str = "", use_cache: bool = True) -> dict:
             continue
         if draft.get("enough_info") is False:
             raise ValueError("The model judged the site too thin to write something specific. Not drafting.")
-        problems = validate(draft, evidence)
+        problems = validate(draft, evidence, pitch)
         if not problems:
             break
 
