@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Site Opener</title>
+<style>
+  :root { --bg:#fafaf9; --fg:#1c1917; --muted:#78716c; --card:#fff; --line:#e7e5e4; --accent:#1d4ed8; --warn:#b45309; --cite:#eef2ff; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#0c0a09; --fg:#f5f5f4; --muted:#a8a29e; --card:#1c1917; --line:#292524; --accent:#93c5fd; --warn:#fbbf24; --cite:#1e1b4b; } }
+  * { box-sizing:border-box }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif }
+  main { max-width:720px; margin:0 auto; padding:40px 16px 80px }
+  h1 { font-size:22px; margin:0 0 4px } .sub { color:var(--muted); margin:0 0 24px }
+  label { display:block; font-size:13px; color:var(--muted); margin:12px 0 4px }
+  input, textarea { width:100%; padding:10px 12px; border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--fg); font:inherit }
+  textarea { min-height:60px; resize:vertical }
+  button { margin-top:14px; padding:10px 18px; border:0; border-radius:8px; background:var(--fg); color:var(--bg); font:inherit; font-weight:600; cursor:pointer }
+  button:disabled { opacity:.5; cursor:wait }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:18px; margin-top:24px }
+  .line { margin:0 0 12px } .line:last-child { margin:0 }
+  .cites { display:flex; flex-wrap:wrap; gap:6px; margin-top:4px }
+  .cite { font-size:12px; background:var(--cite); padding:2px 8px; border-radius:6px; cursor:help; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+  .meta { font-size:13px; color:var(--muted); margin-top:14px }
+  .warn { color:var(--warn); font-size:14px } .err { color:var(--warn) }
+  .row { display:flex; gap:10px; align-items:center } .row button { margin-top:0 }
+  .ghost { background:transparent; color:var(--fg); border:1px solid var(--line) }
+  a { color:var(--accent) }
+</style>
+</head>
+<body>
+<main>
+  <h1>Site Opener</h1>
+  <p class="sub">Paste a company's website. Get a 3-line cold-email opener to its founder, with every claim linked to the sentence on their site it came from.</p>
+  <form id="f">
+    <label for="url">Company website</label>
+    <input id="url" placeholder="e.g. plausible.io" required autofocus>
+    <label for="pitch">What you're offering (optional, one sentence)</label>
+    <textarea id="pitch" placeholder="e.g. An AI tool that tracks MRR, churn and runway and flags what to act on each week."></textarea>
+    <button id="go">Draft opener</button>
+  </form>
+  <div id="out"></div>
+</main>
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+$('#f').onsubmit = async e => {
+  e.preventDefault();
+  const btn = $('#go'); btn.disabled = true; btn.textContent = 'Reading site…';
+  $('#out').innerHTML = '';
+  try {
+    const r = await fetch('/api/opener', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({url: $('#url').value, pitch: $('#pitch').value})});
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'Something went wrong');
+    const lines = d.lines.map(l => `<p class="line">${esc(l.text)}${l.evidence.length ? `<span class="cites">${
+      l.evidence.map(s => `<span class="cite" title="${esc(s.text)}\n— ${esc(s.url)}">“${esc(s.text.slice(0,70))}${s.text.length>70?'…':''}”</span>`).join('')}</span>` : ''}</p>`).join('');
+    const warn = d.warnings.length ? `<p class="warn">Checks still failing after retry, edit before sending:<br>• ${d.warnings.map(esc).join('<br>• ')}</p>` : '';
+    $('#out').innerHTML = `<div class="card">${warn}${lines}
+      <div class="row" style="margin-top:16px"><button class="ghost" id="copy">Copy text</button></div>
+      <p class="meta">Read ${d.pages_read.map(u => `<a href="${esc(u)}" target="_blank" rel="noopener">${esc(new URL(u).pathname)}</a>`).join(', ')}
+      · ${d.attempts} model call${d.attempts>1?'s':''} · ${d.seconds}s${d.cached?' · cached':''}</p></div>`;
+    $('#copy').onclick = () => { navigator.clipboard.writeText(d.lines.map(l => l.text).join('\n')); $('#copy').textContent = 'Copied'; };
+  } catch (err) {
+    $('#out').innerHTML = `<div class="card err">${esc(err.message)}</div>`;
+  } finally { btn.disabled = false; btn.textContent = 'Draft opener'; }
+};
+</script>
+</body>
+</html>
