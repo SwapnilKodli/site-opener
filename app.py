@@ -52,6 +52,21 @@ SUBPAGE_PRIORITY = [
 _cache: dict[str, tuple[float, dict]] = {}
 
 
+def load_dotenv(path: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")) -> None:
+    """Minimal .env loader (KEY=value lines). Real environment variables take precedence."""
+    if not os.path.exists(path):
+        return
+    for line in open(path, encoding="utf-8"):
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            if v.strip():
+                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+load_dotenv()
+
+
 # --------------------------------------------------------------------------- fetch
 class SafeRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):

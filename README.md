@@ -7,7 +7,7 @@ Paste a company's website and get a 3-line cold-email opener to its founder. Eve
 Needs Python 3.10+ and no packages. Get a free key from [Google AI Studio](https://aistudio.google.com/apikey) or [Groq](https://console.groq.com/keys).
 
 ```bash
-export GEMINI_API_KEY=...        # or GROQ_API_KEY=...
+cp .env.example .env              # then paste your key into .env
 python app.py                    # web UI at http://localhost:8000
 python app.py stripe.com "An AI tool that tracks MRR and churn"   # CLI
 PROVIDER=mock python app.py plausible.io                          # no key, tests the pipeline
